@@ -50,10 +50,21 @@ func (f *fakeStore) SaveSession(session store.Session, results []store.StoredRes
 }
 
 func (f *fakeStore) ListSessions(limit, offset int) ([]store.Session, error) {
-	return nil, nil
+	if offset >= len(f.sessions) {
+		return nil, f.err
+	}
+	if limit <= 0 || offset+limit > len(f.sessions) {
+		return f.sessions[offset:], f.err
+	}
+	return f.sessions[offset : offset+limit], f.err
 }
 
 func (f *fakeStore) GetSession(id string) (store.Session, []store.StoredResult, error) {
+	for i, s := range f.sessions {
+		if s.ID == id {
+			return s, f.results[i], f.err
+		}
+	}
 	return store.Session{}, nil, store.ErrSessionNotFound
 }
 
@@ -510,5 +521,199 @@ func TestSortResultsDescending(t *testing.T) {
 		if cp[0].Model.Name != tc.wantFirst {
 			t.Errorf("sort by %q: expected %s first, got %s", tc.key, tc.wantFirst, cp[0].Model.Name)
 		}
+	}
+}
+
+
+func makeHistoryStore(modelSets ...[]string) *fakeStore {
+	base := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{}
+	for i, models := range modelSets {
+		id := fmt.Sprintf("session-%d", i+1)
+		session := store.Session{
+			ID:            id,
+			Timestamp:     base.Add(time.Duration(i) * time.Hour),
+			ModelsTested:  models,
+			Prompt:        "test prompt",
+			ConfigSummary: "runs=3",
+		}
+		results := make([]store.StoredResult, 0, len(models))
+		for _, m := range models {
+			results = append(results, store.StoredResult{
+				ModelName: m,
+				Endpoint:  "local",
+				Aggregate: model.AggregateResult{
+					MinTTFT:      100 * time.Millisecond,
+					MaxTPS:       50.0,
+					SuccessCount: 1,
+				},
+				Runs: []model.RunResult{
+					{TTFT: 100 * time.Millisecond, TokensPerSec: 50.0, TotalTime: 1 * time.Second, TokenCount: 50},
+				},
+			})
+		}
+		fs.sessions = append(fs.sessions, session)
+		fs.results = append(fs.results, results)
+	}
+	return fs
+}
+
+func TestHistoryPrintsSessionTable(t *testing.T) {
+	fs := makeHistoryStore([]string{"llama3", "mistral"})
+	cfg := model.Config{}
+	root := BuildRootCmd(&cfg, fs)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"history"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	output := out.String()
+	if !strings.Contains(output, "2024-06-01") {
+		t.Errorf("expected date in output, got:\n%s", output)
+	}
+	if !strings.Contains(output, "llama3") {
+		t.Errorf("expected model name in output, got:\n%s", output)
+	}
+	if !strings.Contains(output, "BEST TTFT") {
+		t.Errorf("expected BEST TTFT header, got:\n%s", output)
+	}
+}
+
+func TestHistoryEmptyStore(t *testing.T) {
+	fs := &fakeStore{}
+	cfg := model.Config{}
+	root := BuildRootCmd(&cfg, fs)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"history"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	if !strings.Contains(out.String(), "No benchmark history yet") {
+		t.Errorf("expected empty message, got:\n%s", out.String())
+	}
+}
+
+func TestHistoryJSONOutput(t *testing.T) {
+	fs := makeHistoryStore([]string{"llama3"})
+	cfg := model.Config{}
+	root := BuildRootCmd(&cfg, fs)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"history", "--json"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	var sessions []store.Session
+	if err := json.Unmarshal(out.Bytes(), &sessions); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, out.String())
+	}
+	if len(sessions) != 1 {
+		t.Errorf("expected 1 session, got %d", len(sessions))
+	}
+}
+
+func TestHistoryFilterByModel(t *testing.T) {
+	fs := makeHistoryStore([]string{"llama3", "mistral"}, []string{"mistral"}, []string{"llama3"})
+	cfg := model.Config{}
+	root := BuildRootCmd(&cfg, fs)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"history", "--model", "llama3", "--json"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	var sessions []store.Session
+	if err := json.Unmarshal(out.Bytes(), &sessions); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, out.String())
+	}
+	if len(sessions) != 2 {
+		t.Errorf("expected 2 sessions with llama3, got %d", len(sessions))
+	}
+	for _, s := range sessions {
+		found := false
+		for _, m := range s.ModelsTested {
+			if m == "llama3" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("session %s does not contain llama3", s.ID)
+		}
+	}
+}
+
+func TestHistoryLimit(t *testing.T) {
+	modelSets := make([][]string, 10)
+	for i := range modelSets {
+		modelSets[i] = []string{"llama3"}
+	}
+	fs := makeHistoryStore(modelSets...)
+	cfg := model.Config{}
+	root := BuildRootCmd(&cfg, fs)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"history", "--limit", "5", "--json"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	var sessions []store.Session
+	if err := json.Unmarshal(out.Bytes(), &sessions); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, out.String())
+	}
+	if len(sessions) != 5 {
+		t.Errorf("expected 5 sessions, got %d", len(sessions))
+	}
+}
+
+func TestHistoryDetail(t *testing.T) {
+	fs := makeHistoryStore([]string{"llama3", "mistral"})
+	cfg := model.Config{}
+	root := BuildRootCmd(&cfg, fs)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"history", "--detail", "session-1"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	output := out.String()
+	if !strings.Contains(output, "Session: session-1") {
+		t.Errorf("expected session header, got:\n%s", output)
+	}
+	if !strings.Contains(output, "llama3") {
+		t.Errorf("expected model name, got:\n%s", output)
+	}
+	if !strings.Contains(output, "RUN") {
+		t.Errorf("expected per-run breakdown header, got:\n%s", output)
+	}
+}
+
+func TestHistoryNilStore(t *testing.T) {
+	cfg := model.Config{}
+	root := BuildRootCmd(&cfg, nil)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"history"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	if !strings.Contains(out.String(), "History not available (database not initialized)") {
+		t.Errorf("expected nil store message, got:\n%s", out.String())
 	}
 }
