@@ -19,7 +19,7 @@ import (
 // Default constants used when no higher-precedence source provides a value.
 const (
 	DefaultLocalURL  = "http://localhost:11434"
-	DefaultCloudURL  = "https://ollama.com/api"
+	DefaultCloudURL  = "https://ollama.com"
 	DefaultRuns      = 5
 	DefaultWarmup    = 1
 	DefaultPrompt    = "Tell me a short story about a robot learning to paint."

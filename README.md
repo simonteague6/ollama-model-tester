@@ -105,7 +105,7 @@ timeout = "60s"
 parallel = 1
 sort_key = "ttft"
 api_key = "sk-..."     # optional — can also use OLLAMA_API_KEY env var
-
+```
 ### API key
 
 Set your Ollama Cloud API key using either method:
