@@ -10,9 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/simonteague6/ollama-model-tester/internal/benchmark"
 	"github.com/simonteague6/ollama-model-tester/internal/model"
+	"github.com/simonteague6/ollama-model-tester/internal/store"
+	"github.com/spf13/cobra"
 )
 
 type fakeRunner struct {
@@ -34,6 +35,26 @@ func (f *fakeClient) ListModels(ctx context.Context) ([]model.Model, error) {
 
 func (f *fakeClient) Generate(ctx context.Context, req model.GenerateRequest) (model.GenerateStream, error) {
 	return nil, errors.New("not implemented")
+}
+
+type fakeStore struct {
+	sessions []store.Session
+	results  [][]store.StoredResult
+	err      error
+}
+
+func (f *fakeStore) SaveSession(session store.Session, results []store.StoredResult) error {
+	f.sessions = append(f.sessions, session)
+	f.results = append(f.results, results)
+	return f.err
+}
+
+func (f *fakeStore) ListSessions(limit, offset int) ([]store.Session, error) {
+	return nil, nil
+}
+
+func (f *fakeStore) GetSession(id string) (store.Session, []store.StoredResult, error) {
+	return store.Session{}, nil, store.ErrSessionNotFound
 }
 
 func setFakeRunner(results []benchmark.Result) func() {
@@ -61,14 +82,14 @@ func setFakeClients(local, cloud []model.Model) func() {
 
 func TestBareRootPrintsStub(t *testing.T) {
 	cfg := model.Config{}
-	root := BuildRootCmd(&cfg)
+	root := BuildRootCmd(&cfg, nil)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetArgs([]string{})
 
 	// Override TUI launch to avoid blocking on real bubbletea program.
 	orig := runTUIProgram
-	runTUIProgram = func(cmd *cobra.Command, cfg *model.Config) {
+	runTUIProgram = func(cmd *cobra.Command, cfg *model.Config, st store.Store) {
 		fmt.Fprintln(cmd.OutOrStdout(), "TUI launched")
 	}
 	defer func() { runTUIProgram = orig }()
@@ -83,13 +104,13 @@ func TestBareRootPrintsStub(t *testing.T) {
 
 func TestTuiCommandPrintsStub(t *testing.T) {
 	cfg := model.Config{}
-	root := BuildRootCmd(&cfg)
+	root := BuildRootCmd(&cfg, nil)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetArgs([]string{"tui"})
 
 	orig := runTUIProgram
-	runTUIProgram = func(cmd *cobra.Command, cfg *model.Config) {
+	runTUIProgram = func(cmd *cobra.Command, cfg *model.Config, st store.Store) {
 		fmt.Fprintln(cmd.OutOrStdout(), "TUI launched")
 	}
 	defer func() { runTUIProgram = orig }()
@@ -117,7 +138,7 @@ func TestFlagBindingOnlyChangesSetFlags(t *testing.T) {
 	}
 	defer setFakeRunner(nil)()
 
-	root := BuildRootCmd(&cfg)
+	root := BuildRootCmd(&cfg, nil)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&out)
@@ -157,7 +178,7 @@ func TestFlagBindingOnlyChangesSetFlags(t *testing.T) {
 
 func TestCloudAPIKeyPreFlight(t *testing.T) {
 	cfg := model.Config{CloudURL: "https://ollama.com/api"} // APIKey intentionally empty
-	root := BuildRootCmd(&cfg)
+	root := BuildRootCmd(&cfg, nil)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&out)
@@ -183,7 +204,7 @@ func TestListOutputFormat(t *testing.T) {
 		[]model.Model{{Name: "cloud-model", Endpoint: "cloud"}},
 	)()
 
-	root := BuildRootCmd(&cfg)
+	root := BuildRootCmd(&cfg, nil)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetArgs([]string{"list", "--both"})
@@ -227,7 +248,7 @@ func TestRunWithFakeClient(t *testing.T) {
 	}
 	defer setFakeRunner(results)()
 
-	root := BuildRootCmd(&cfg)
+	root := BuildRootCmd(&cfg, nil)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetArgs([]string{"run", "llama", "--cloud"})
@@ -247,6 +268,7 @@ func TestRunWithFakeClient(t *testing.T) {
 		t.Errorf("expected OK count, got:\n%s", output)
 	}
 }
+
 func TestRunPrintsPartialResultsOnCancellation(t *testing.T) {
 	cfg := model.Config{
 		APIKey:   "secret",
@@ -269,7 +291,7 @@ func TestRunPrintsPartialResultsOnCancellation(t *testing.T) {
 	}
 	defer setFakeRunnerWithErr(results, context.Canceled)()
 
-	root := BuildRootCmd(&cfg)
+	root := BuildRootCmd(&cfg, nil)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetArgs([]string{"run", "llama", "--cloud"})
@@ -322,7 +344,7 @@ func TestRunJSONGoldenOutput(t *testing.T) {
 	}
 	defer setFakeRunner(results)()
 
-	root := BuildRootCmd(&cfg)
+	root := BuildRootCmd(&cfg, nil)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetArgs([]string{"run", "llama", "--cloud", "--json"})
@@ -359,6 +381,107 @@ func TestRunJSONGoldenOutput(t *testing.T) {
 	}
 }
 
+func TestRunSavesSessionWithFakeStore(t *testing.T) {
+	cfg := model.Config{
+		APIKey:    "secret",
+		CloudURL:  "https://cloud",
+		Prompt:    "test prompt",
+		Runs:      3,
+		Warmup:    1,
+		MaxTokens: 128,
+		Timeout:   30 * time.Second,
+		Parallel:  2,
+	}
+	results := []benchmark.Result{
+		{
+			Model: model.Model{Name: "llama", Endpoint: "cloud"},
+			Aggregate: model.AggregateResult{
+				MeanTTFT:     100 * time.Millisecond,
+				MedianTTFT:   100 * time.Millisecond,
+				MeanTPS:      50.0,
+				MedianTPS:    50.0,
+				MeanTotal:    1 * time.Second,
+				MedianTotal:  1 * time.Second,
+				SuccessCount: 3,
+				FailCount:    0,
+			},
+			Runs: []model.RunResult{
+				{TTFT: 100 * time.Millisecond, TokensPerSec: 50.0, TotalTime: 1 * time.Second, TokenCount: 10},
+			},
+		},
+	}
+	defer setFakeRunner(results)()
+
+	fs := &fakeStore{}
+	root := BuildRootCmd(&cfg, fs)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{"run", "llama", "--cloud"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	if len(fs.sessions) != 1 {
+		t.Fatalf("expected 1 saved session, got %d", len(fs.sessions))
+	}
+	if len(fs.results) != 1 || len(fs.results[0]) != 1 {
+		t.Fatalf("expected 1 stored result, got %d", len(fs.results))
+	}
+	if fs.results[0][0].ModelName != "llama" {
+		t.Errorf("stored result model: got %q, want llama", fs.results[0][0].ModelName)
+	}
+	if fs.sessions[0].Prompt != "test prompt" {
+		t.Errorf("session prompt: got %q, want %q", fs.sessions[0].Prompt, "test prompt")
+	}
+	if len(fs.sessions[0].ModelsTested) != 1 || fs.sessions[0].ModelsTested[0] != "llama" {
+		t.Errorf("session models tested: got %v, want [llama]", fs.sessions[0].ModelsTested)
+	}
+}
+
+func TestRunSaveFailureLogsWarning(t *testing.T) {
+	cfg := model.Config{
+		APIKey:   "secret",
+		CloudURL: "https://cloud",
+	}
+	results := []benchmark.Result{
+		{
+			Model: model.Model{Name: "llama", Endpoint: "cloud"},
+			Aggregate: model.AggregateResult{
+				MeanTTFT:     100 * time.Millisecond,
+				MedianTTFT:   100 * time.Millisecond,
+				MeanTPS:      50.0,
+				MedianTPS:    50.0,
+				MeanTotal:    1 * time.Second,
+				MedianTotal:  1 * time.Second,
+				SuccessCount: 3,
+				FailCount:    0,
+			},
+		},
+	}
+	defer setFakeRunner(results)()
+
+	fs := &fakeStore{err: errors.New("disk full")}
+	root := BuildRootCmd(&cfg, fs)
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&errOut)
+	root.SetArgs([]string{"run", "llama", "--cloud"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	if len(fs.sessions) != 1 {
+		t.Fatalf("expected save attempt, got %d sessions", len(fs.sessions))
+	}
+	if !strings.Contains(errOut.String(), "disk full") {
+		t.Errorf("expected warning in stderr, got:\n%s", errOut.String())
+	}
+}
+
 func TestSortResultsDescending(t *testing.T) {
 	results := []benchmark.Result{
 		{
@@ -372,7 +495,7 @@ func TestSortResultsDescending(t *testing.T) {
 	}
 
 	tests := []struct {
-		key      string
+		key       string
 		wantFirst string
 	}{
 		{"tok/s", "b"},

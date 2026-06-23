@@ -1,8 +1,10 @@
 package tui
 
 import (
+	"errors"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/simonteague6/ollama-model-tester/internal/benchmark"
 	"github.com/simonteague6/ollama-model-tester/internal/metrics"
 	"github.com/simonteague6/ollama-model-tester/internal/model"
+	"github.com/simonteague6/ollama-model-tester/internal/store"
 )
 
 var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
@@ -83,8 +86,41 @@ func makeRun(ttft, total time.Duration, tps float64, tokens int) model.RunResult
 	}
 }
 
+type fakeStore struct {
+	mu       sync.Mutex
+	sessions []store.Session
+	results  [][]store.StoredResult
+	done     chan struct{}
+	err      error
+}
+
+func (f *fakeStore) SaveSession(session store.Session, results []store.StoredResult) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sessions = append(f.sessions, session)
+	f.results = append(f.results, results)
+	if f.done != nil {
+		f.done <- struct{}{}
+	}
+	return f.err
+}
+
+func (f *fakeStore) ListSessions(limit, offset int) ([]store.Session, error) {
+	return nil, nil
+}
+
+func (f *fakeStore) GetSession(id string) (store.Session, []store.StoredResult, error) {
+	return store.Session{}, nil, store.ErrSessionNotFound
+}
+
+func (f *fakeStore) savedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.sessions)
+}
+
 func TestSelectScreenLoadsAndDisplaysModels(t *testing.T) {
-	m := New(testConfig(), nil, nil)
+	m := New(testConfig(), nil, nil, nil)
 	m, _ = update(m, ListLoadedMsg{Models: []model.Model{
 		{Name: "llama3", Endpoint: "local"},
 		{Name: "mistral", Endpoint: "cloud"},
@@ -105,7 +141,7 @@ func TestSelectScreenLoadsAndDisplaysModels(t *testing.T) {
 }
 
 func TestFilterNarrowsModelList(t *testing.T) {
-	m := New(testConfig(), nil, nil)
+	m := New(testConfig(), nil, nil, nil)
 	m, _ = update(m, ListLoadedMsg{Models: []model.Model{
 		{Name: "alpha"},
 		{Name: "alphabet"},
@@ -130,7 +166,7 @@ func TestFilterNarrowsModelList(t *testing.T) {
 }
 
 func TestSpaceTogglesSelection(t *testing.T) {
-	m := New(testConfig(), nil, nil)
+	m := New(testConfig(), nil, nil, nil)
 	m, _ = update(m, ListLoadedMsg{Models: []model.Model{
 		{Name: "llama3", Endpoint: "local"},
 		{Name: "mistral", Endpoint: "cloud"},
@@ -148,7 +184,7 @@ func TestSpaceTogglesSelection(t *testing.T) {
 }
 
 func TestFullFlowSelectRunningResultsDetailResults(t *testing.T) {
-	m := New(testConfig(), nil, nil)
+	m := New(testConfig(), nil, nil, nil)
 	m, _ = update(m, ListLoadedMsg{Models: []model.Model{
 		{Name: "llama3", Endpoint: "local"},
 		{Name: "mistral", Endpoint: "cloud"},
@@ -207,7 +243,7 @@ func TestFullFlowSelectRunningResultsDetailResults(t *testing.T) {
 }
 
 func TestSortKeyCycling(t *testing.T) {
-	m := New(testConfig(), nil, nil)
+	m := New(testConfig(), nil, nil, nil)
 	m, _ = update(m, ListLoadedMsg{Models: []model.Model{
 		{Name: "fast", Endpoint: "local"},
 		{Name: "slow", Endpoint: "cloud"},
@@ -240,7 +276,7 @@ func TestSortKeyCycling(t *testing.T) {
 }
 
 func TestCancelDuringRunningReturnsPartialResults(t *testing.T) {
-	m := New(testConfig(), nil, nil)
+	m := New(testConfig(), nil, nil, nil)
 	m, _ = update(m, ListLoadedMsg{Models: []model.Model{
 		{Name: "llama3", Endpoint: "local"},
 	}})
@@ -270,7 +306,7 @@ func TestCancelDuringRunningReturnsPartialResults(t *testing.T) {
 }
 
 func TestResultsRReturnsToSelectAndQQuits(t *testing.T) {
-	m := New(testConfig(), nil, nil)
+	m := New(testConfig(), nil, nil, nil)
 	m, _ = update(m, ListLoadedMsg{Models: []model.Model{
 		{Name: "llama3", Endpoint: "local"},
 	}})
@@ -300,7 +336,7 @@ func TestResultsRReturnsToSelectAndQQuits(t *testing.T) {
 }
 
 func TestDetailViewIncludesAggregateAndPerRunData(t *testing.T) {
-	m := New(testConfig(), nil, nil)
+	m := New(testConfig(), nil, nil, nil)
 	m, _ = update(m, ListLoadedMsg{Models: []model.Model{
 		{Name: "llama3", Endpoint: "local"},
 	}})
@@ -333,5 +369,74 @@ func TestDetailViewIncludesAggregateAndPerRunData(t *testing.T) {
 		if !strings.Contains(v, r) {
 			t.Errorf("expected detail view to contain %q, got:\n%s", r, v)
 		}
+	}
+}
+
+func TestRunDoneMsgSavesSession(t *testing.T) {
+	fs := &fakeStore{done: make(chan struct{}, 1)}
+	m := New(testConfig(), nil, nil, fs)
+	m, _ = update(m, ListLoadedMsg{Models: []model.Model{
+		{Name: "llama3", Endpoint: "local"},
+	}})
+	m = pressKeys(m, "space", "enter")
+
+	runs := []model.RunResult{
+		makeRun(10*time.Millisecond, 50*time.Millisecond, 20, 10),
+		makeRun(11*time.Millisecond, 51*time.Millisecond, 19, 10),
+		makeRun(9*time.Millisecond, 49*time.Millisecond, 21, 10),
+	}
+	m, _ = update(m, RunDoneMsg{Results: []benchmark.Result{
+		{Model: model.Model{Name: "llama3", Endpoint: "local"}, Runs: runs, Aggregate: metrics.Aggregate(runs)},
+	}})
+
+	if m.state != screenResults {
+		t.Fatalf("expected state Results, got %d", m.state)
+	}
+
+	select {
+	case <-fs.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for SaveSession")
+	}
+
+	if fs.savedCount() != 1 {
+		t.Fatalf("expected 1 saved session, got %d", fs.savedCount())
+	}
+	if len(fs.results) != 1 || len(fs.results[0]) != 1 {
+		t.Fatalf("expected 1 stored result, got %d sessions", fs.savedCount())
+	}
+	if fs.results[0][0].ModelName != "llama3" {
+		t.Errorf("stored result model: got %q, want llama3", fs.results[0][0].ModelName)
+	}
+	if fs.sessions[0].Prompt != "" {
+		t.Errorf("session prompt: got %q, want empty", fs.sessions[0].Prompt)
+	}
+}
+
+func TestRunDoneMsgSaveFailureDoesNotBlockTransition(t *testing.T) {
+	fs := &fakeStore{done: make(chan struct{}, 1), err: errors.New("disk full")}
+	m := New(testConfig(), nil, nil, fs)
+	m, _ = update(m, ListLoadedMsg{Models: []model.Model{
+		{Name: "llama3", Endpoint: "local"},
+	}})
+	m = pressKeys(m, "space", "enter")
+
+	runs := []model.RunResult{makeRun(10*time.Millisecond, 50*time.Millisecond, 20, 10)}
+	m, _ = update(m, RunDoneMsg{Results: []benchmark.Result{
+		{Model: model.Model{Name: "llama3", Endpoint: "local"}, Runs: runs, Aggregate: metrics.Aggregate(runs)},
+	}})
+
+	if m.state != screenResults {
+		t.Fatalf("expected state Results despite save error, got %d", m.state)
+	}
+
+	select {
+	case <-fs.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for SaveSession attempt")
+	}
+
+	if fs.savedCount() != 1 {
+		t.Fatalf("expected save attempt, got %d", fs.savedCount())
 	}
 }
