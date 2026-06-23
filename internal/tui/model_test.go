@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/simonteague6/ollama-model-tester/internal/benchmark"
@@ -73,6 +74,18 @@ func pressKeys(m *AppModel, keys ...string) *AppModel {
 	return m
 }
 
+func runCmd(m *AppModel, cmd tea.Cmd) *AppModel {
+	if cmd == nil {
+		return m
+	}
+	msg := cmd()
+	if msg == nil {
+		return m
+	}
+	m, _ = update(m, msg)
+	return m
+}
+
 func testConfig() model.Config {
 	return model.Config{Runs: 3}
 }
@@ -87,11 +100,14 @@ func makeRun(ttft, total time.Duration, tps float64, tokens int) model.RunResult
 }
 
 type fakeStore struct {
-	mu       sync.Mutex
-	sessions []store.Session
-	results  [][]store.StoredResult
-	done     chan struct{}
-	err      error
+	mu           sync.Mutex
+	sessions     []store.Session
+	results      [][]store.StoredResult
+	listSessions []store.Session
+	listErr      error
+	getSessions  map[string][]store.StoredResult
+	done         chan struct{}
+	err          error
 }
 
 func (f *fakeStore) SaveSession(session store.Session, results []store.StoredResult) error {
@@ -106,10 +122,13 @@ func (f *fakeStore) SaveSession(session store.Session, results []store.StoredRes
 }
 
 func (f *fakeStore) ListSessions(limit, offset int) ([]store.Session, error) {
-	return nil, nil
+	return f.listSessions, f.listErr
 }
 
 func (f *fakeStore) GetSession(id string) (store.Session, []store.StoredResult, error) {
+	if res, ok := f.getSessions[id]; ok {
+		return store.Session{ID: id}, res, nil
+	}
 	return store.Session{}, nil, store.ErrSessionNotFound
 }
 
@@ -440,3 +459,136 @@ func TestRunDoneMsgSaveFailureDoesNotBlockTransition(t *testing.T) {
 		t.Fatalf("expected save attempt, got %d", fs.savedCount())
 	}
 }
+
+func TestHKeyOnSelectOpensHistory(t *testing.T) {
+	fs := &fakeStore{listSessions: []store.Session{{ID: "s1", Timestamp: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC), ModelsTested: []string{"m1"}}}}
+	m := New(testConfig(), nil, nil, fs)
+	m, cmd := update(m, keyMsg("h"))
+	if m.state != screenSelect {
+		t.Fatalf("expected select while loading, got %v", m.state)
+	}
+	m = runCmd(m, cmd)
+	if m.state != screenHistory {
+		t.Fatalf("expected history, got %v", m.state)
+	}
+	if !viewContains(m, "History") {
+		t.Fatalf("expected History header, got %q", viewString(m))
+	}
+}
+
+func TestHistoryEmptyShowsNoHistoryYet(t *testing.T) {
+	fs := &fakeStore{}
+	m := New(testConfig(), nil, nil, fs)
+	m, cmd := update(m, keyMsg("h"))
+	m = runCmd(m, cmd)
+	if m.state != screenHistory {
+		t.Fatalf("expected history, got %v", m.state)
+	}
+	if !viewContains(m, "No history yet") {
+		t.Fatalf("expected 'No history yet', got %q", viewString(m))
+	}
+}
+
+func TestHistoryShowsSessionRows(t *testing.T) {
+	ts := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		listSessions: []store.Session{
+			{ID: "s1", Timestamp: ts, ModelsTested: []string{"m1", "m2"}},
+		},
+		getSessions: map[string][]store.StoredResult{
+			"s1": {
+				{ModelName: "m1", Endpoint: "local", Aggregate: model.AggregateResult{MeanTTFT: 10 * time.Millisecond, MeanTPS: 5.0, SuccessCount: 1}},
+				{ModelName: "m2", Endpoint: "local", Aggregate: model.AggregateResult{MeanTTFT: 5 * time.Millisecond, MeanTPS: 10.0, SuccessCount: 1}},
+			},
+		},
+	}
+	m := New(testConfig(), nil, nil, fs)
+	m, cmd := update(m, keyMsg("h"))
+	m = runCmd(m, cmd)
+	view := viewString(m)
+	if !strings.Contains(view, "2026-01-01") {
+		t.Fatalf("expected date in view, got %q", view)
+	}
+	if !strings.Contains(view, "2 models") {
+		t.Fatalf("expected model count in view, got %q", view)
+	}
+	if !strings.Contains(view, "TTFT:5ms") {
+		t.Fatalf("expected best TTFT in view, got %q", view)
+	}
+	if !strings.Contains(view, "TPS:10.0") {
+		t.Fatalf("expected best tok/s in view, got %q", view)
+	}
+}
+
+func TestEscFromHistoryReturnsToSelect(t *testing.T) {
+	fs := &fakeStore{listSessions: []store.Session{{ID: "s1"}}}
+	m := New(testConfig(), nil, nil, fs)
+	m, cmd := update(m, keyMsg("h"))
+	m = runCmd(m, cmd)
+	if m.state != screenHistory {
+		t.Fatalf("expected history, got %v", m.state)
+	}
+	m, _ = update(m, keyMsg("esc"))
+	if m.state != screenSelect {
+		t.Fatalf("expected select after esc, got %v", m.state)
+	}
+}
+
+func TestEnterOnSessionShowsModels(t *testing.T) {
+	fs := &fakeStore{
+		listSessions: []store.Session{{ID: "s1", Timestamp: time.Now(), ModelsTested: []string{"m1", "m2"}}},
+		getSessions: map[string][]store.StoredResult{
+			"s1": {
+				{ModelName: "m1", Endpoint: "local"},
+				{ModelName: "m2", Endpoint: "cloud"},
+			},
+		},
+	}
+	m := New(testConfig(), nil, nil, fs)
+	m, cmd := update(m, keyMsg("h"))
+	m = runCmd(m, cmd)
+	if m.state != screenHistory {
+		t.Fatalf("expected history, got %v", m.state)
+	}
+	m, cmd = update(m, keyMsg("enter"))
+	if m.sessionModels != nil {
+		t.Fatal("expected models not loaded until cmd runs")
+	}
+	m = runCmd(m, cmd)
+	if len(m.sessionModels) != 2 {
+		t.Fatalf("expected 2 models, got %d", len(m.sessionModels))
+	}
+	if !viewContains(m, "m1") {
+		t.Fatalf("expected m1 in view, got %q", viewString(m))
+	}
+	if !viewContains(m, "m2") {
+		t.Fatalf("expected m2 in view, got %q", viewString(m))
+	}
+}
+
+func TestEnterOnSessionModelOpensDetail(t *testing.T) {
+	fs := &fakeStore{
+		listSessions: []store.Session{{ID: "s1", Timestamp: time.Now(), ModelsTested: []string{"m1"}}},
+		getSessions: map[string][]store.StoredResult{
+			"s1": {
+				{ModelName: "m1", Endpoint: "local", Aggregate: model.AggregateResult{MeanTTFT: 5 * time.Millisecond, MeanTPS: 7.5, SuccessCount: 1}},
+			},
+		},
+	}
+	m := New(testConfig(), nil, nil, fs)
+	m, cmd := update(m, keyMsg("h"))
+	m = runCmd(m, cmd)
+	m, cmd = update(m, keyMsg("enter"))
+	m = runCmd(m, cmd)
+	m, _ = update(m, keyMsg("enter"))
+	if m.state != screenDetail {
+		t.Fatalf("expected detail, got %v", m.state)
+	}
+	if !viewContains(m, "m1") {
+		t.Fatalf("expected m1 in detail, got %q", viewString(m))
+	}
+	if !viewContains(m, "Aggregate stats") {
+		t.Fatalf("expected aggregate stats, got %q", viewString(m))
+	}
+}
+

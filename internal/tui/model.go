@@ -27,7 +27,7 @@ import (
 	"github.com/simonteague6/ollama-model-tester/internal/store"
 )
 
-// screen enumerates the four TUI states.
+// screen enumerates the five TUI states.
 type screen int
 
 const (
@@ -35,6 +35,7 @@ const (
 	screenRunning
 	screenResults
 	screenDetail
+	screenHistory
 )
 
 // endpointMode selects which endpoints are discovered and benchmarked.
@@ -100,6 +101,19 @@ type RunDoneMsg struct {
 	Err     error
 }
 
+// SessionsLoadedMsg is delivered when past sessions have been fetched.
+type SessionsLoadedMsg struct {
+	Sessions []store.Session
+	Results  [][]store.StoredResult
+	Err      error
+}
+
+// SessionModelsLoadedMsg is delivered when a session's results are loaded.
+type SessionModelsLoadedMsg struct {
+	Models []store.StoredResult
+	Err    error
+}
+
 // listItem wraps a model.Model for display in the list component.
 type listItem struct {
 	model    model.Model
@@ -114,6 +128,42 @@ func (i listItem) Title() string {
 	return "[ ] " + i.model.Name
 }
 func (i listItem) Description() string { return i.model.Endpoint }
+
+// historySessionItem wraps a store.Session for display in the history list.
+type historySessionItem struct {
+	session store.Session
+	results []store.StoredResult
+}
+
+func (i historySessionItem) FilterValue() string {
+	return i.session.Timestamp.Format(time.RFC3339) + " " + strings.Join(i.session.ModelsTested, " ")
+}
+
+func (i historySessionItem) Title() string {
+	bestTTFT, bestTPS := bestSessionMetrics(i.results)
+	return fmt.Sprintf("%s  %d models  TTFT:%s  TPS:%.1f",
+		i.session.Timestamp.Format("2006-01-02"),
+		len(i.session.ModelsTested),
+		formatDuration(bestTTFT),
+		bestTPS)
+}
+func (i historySessionItem) Description() string { return "" }
+
+// historyModelItem wraps a store.StoredResult for display in the history model list.
+type historyModelItem struct {
+	result store.StoredResult
+}
+func (i historyModelItem) FilterValue() string { return i.result.ModelName + " " + i.result.Endpoint }
+
+func (i historyModelItem) Title() string {
+	return fmt.Sprintf("%s (%s)  TTFT:%s  tok/s:%.1f",
+		i.result.ModelName,
+		i.result.Endpoint,
+		formatDuration(i.result.Aggregate.MeanTTFT),
+		i.result.Aggregate.MeanTPS)
+}
+
+func (i historyModelItem) Description() string { return "" }
 
 // runEvent is the internal channel payload used by the benchmark goroutine.
 type runEvent struct {
@@ -135,6 +185,7 @@ type keyMap struct {
 	Start        key.Binding
 	Rerun        key.Binding
 	Back         key.Binding
+	History      key.Binding
 }
 
 func defaultKeyMap() keyMap {
@@ -171,6 +222,10 @@ func defaultKeyMap() keyMap {
 			key.WithKeys("esc", "backspace"),
 			key.WithHelp("esc", "back"),
 		),
+		History: key.NewBinding(
+			key.WithKeys("h"),
+			key.WithHelp("h", "history"),
+		),
 	}
 }
 
@@ -185,28 +240,33 @@ type AppModel struct {
 	width    int
 	height   int
 
-	list     list.Model
-	table    table.Model
-	viewport viewport.Model
-	spinner  spinner.Model
-	progress progress.Model
+	list          list.Model
+	table         table.Model
+	viewport      viewport.Model
+	spinner       spinner.Model
+	progress      progress.Model
+	historyList   list.Model
 
 	keys keyMap
 
-	results      []benchmark.Result
-	selected     map[string]bool
-	runProgress  map[string][]model.RunResult
-	runLive      []benchmark.Result
-	completed    int
-	total        int
-	sortKey      sortKey
-	detailResult benchmark.Result
-	runCh        chan runEvent
-	runCtx       context.Context
-	runCancel    context.CancelFunc
-	cancelling   bool
-	loadingErr   error
-	store        store.Store
+	results          []benchmark.Result
+	selected         map[string]bool
+	runProgress      map[string][]model.RunResult
+	runLive          []benchmark.Result
+	completed        int
+	total            int
+	sortKey          sortKey
+	detailResult     benchmark.Result
+	runCh            chan runEvent
+	runCtx           context.Context
+	runCancel        context.CancelFunc
+	cancelling       bool
+	loadingErr       error
+	store            store.Store
+	sessions         []store.Session
+	sessionModels    []store.StoredResult
+	historyResults   map[string][]store.StoredResult
+	historyFiltering bool
 }
 
 // New creates an AppModel ready to be run by tea.NewProgram.
@@ -224,6 +284,18 @@ func New(cfg model.Config, local, cloud model.Client, st store.Store) *AppModel 
 	lm.SetFilteringEnabled(true)
 	lm.DisableQuitKeybindings()
 	lm.SetShowHelp(false)
+
+	histDelegate := list.NewDefaultDelegate()
+	histDelegate.ShowDescription = false
+	histDelegate.SetHeight(1)
+	histDelegate.SetSpacing(0)
+
+	hm := list.New(nil, histDelegate, width, max(4, height-3))
+	hm.SetShowTitle(false)
+	hm.SetShowStatusBar(false)
+	hm.SetFilteringEnabled(true)
+	hm.DisableQuitKeybindings()
+	hm.SetShowHelp(false)
 
 	tm := table.New(
 		table.WithColumns([]table.Column{
@@ -252,21 +324,23 @@ func New(cfg model.Config, local, cloud model.Client, st store.Store) *AppModel 
 	)
 
 	return &AppModel{
-		cfg:         cfg,
-		localClient: local,
-		cloudClient: cloud,
-		store:       st,
-		state:       screenSelect,
-		endpoint:    endpointBoth,
-		width:       width,
-		height:      height,
-		list:        lm,
-		table:       tm,
-		viewport:    vp,
-		spinner:     sm,
-		progress:    pm,
-		keys:        defaultKeyMap(),
-		selected:    make(map[string]bool),
+		cfg:              cfg,
+		localClient:      local,
+		cloudClient:      cloud,
+		store:            st,
+		state:            screenSelect,
+		endpoint:         endpointBoth,
+		width:            width,
+		height:           height,
+		list:             lm,
+		table:            tm,
+		viewport:         vp,
+		spinner:          sm,
+		progress:         pm,
+		historyList:      hm,
+		keys:             defaultKeyMap(),
+		selected:         make(map[string]bool),
+		historyResults:   make(map[string][]store.StoredResult),
 	}
 }
 
@@ -325,6 +399,28 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resize()
 		return m, nil
 
+	case SessionsLoadedMsg:
+		m.loadingErr = msg.Err
+		m.sessions = msg.Sessions
+		m.historyResults = make(map[string][]store.StoredResult, len(msg.Sessions))
+		for i, s := range msg.Sessions {
+			if i < len(msg.Results) {
+				m.historyResults[s.ID] = msg.Results[i]
+			}
+		}
+		m.buildHistoryItems()
+		m.sessionModels = nil
+		m.state = screenHistory
+		m.resize()
+		return m, nil
+
+	case SessionModelsLoadedMsg:
+		m.loadingErr = msg.Err
+		m.sessionModels = msg.Models
+		m.buildHistoryModelItems()
+		m.historyList.SetFilterText("")
+		return m, nil
+
 	case tea.KeyPressMsg:
 		return m.handleKeyPress(msg)
 
@@ -355,6 +451,8 @@ func (m *AppModel) View() tea.View {
 		content = m.resultsView()
 	case screenDetail:
 		content = m.detailView()
+	case screenHistory:
+		content = m.historyView()
 	}
 	view := tea.NewView(content)
 	view.AltScreen = true
@@ -373,6 +471,8 @@ func (m *AppModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handleResultsKey(msg)
 	case screenDetail:
 		return m.handleDetailKey(msg)
+	case screenHistory:
+		return m.handleHistoryKey(msg)
 	}
 	return m, nil
 }
@@ -408,6 +508,12 @@ func (m *AppModel) handleSelectKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.state = screenRunning
 		m.resize()
 		return m, tea.Batch(m.runCmd(), m.spinnerTickCmd())
+
+	case key.Matches(msg, m.keys.History):
+		if m.store == nil {
+			return m, nil
+		}
+		return m, m.loadSessionsCmd()
 	}
 
 	return m.delegateUpdate(msg)
@@ -472,6 +578,74 @@ func (m *AppModel) handleDetailKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m *AppModel) handleHistoryKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.historyList.SettingFilter() {
+		m.historyFiltering = true
+		return m.delegateUpdate(msg)
+	}
+
+	switch {
+	case key.Matches(msg, m.keys.Quit):
+		return m, tea.Quit
+	}
+
+	if m.sessionModels != nil {
+		switch {
+		case key.Matches(msg, m.keys.Back):
+			m.sessionModels = nil
+			m.buildHistoryItems()
+			m.historyList.SetFilterText("")
+			m.historyFiltering = false
+			return m, nil
+
+		case key.Matches(msg, m.keys.Start):
+			item := m.historyList.SelectedItem()
+			if item == nil {
+				return m, nil
+			}
+			mi, ok := item.(historyModelItem)
+			if !ok {
+				return m, nil
+			}
+			sr := mi.result
+			m.detailResult = benchmark.Result{
+				Model:     model.Model{Name: sr.ModelName, Endpoint: sr.Endpoint},
+				Runs:      sr.Runs,
+				Aggregate: sr.Aggregate,
+			}
+			m.buildDetailView()
+			m.state = screenDetail
+			m.resize()
+			return m, nil
+		}
+		return m.delegateUpdate(msg)
+	}
+
+	switch {
+	case key.Matches(msg, m.keys.Back):
+		m.state = screenSelect
+		m.resize()
+		return m, nil
+
+	case key.Matches(msg, m.keys.Start):
+		item := m.historyList.SelectedItem()
+		if item == nil {
+			return m, nil
+		}
+		si, ok := item.(historySessionItem)
+		if !ok {
+			return m, nil
+		}
+		return m, m.loadSessionModelsCmd(si.session.ID)
+
+	case msg.String() == "/":
+		m.historyFiltering = true
+		return m.delegateUpdate(msg)
+	}
+
+	return m.delegateUpdate(msg)
+}
+
 func (m *AppModel) delegateUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.state {
 	case screenSelect:
@@ -485,6 +659,11 @@ func (m *AppModel) delegateUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case screenDetail:
 		v, cmd := m.viewport.Update(msg)
 		m.viewport = v
+		return m, cmd
+	case screenHistory:
+		l, cmd := m.historyList.Update(msg)
+		m.historyList = l
+		m.historyFiltering = m.historyList.SettingFilter()
 		return m, cmd
 	}
 	return m, nil
@@ -536,6 +715,31 @@ func (m *AppModel) loadModelsCmd() tea.Cmd {
 			err = errs[0]
 		}
 		return ListLoadedMsg{Models: out, Err: err}
+	}
+}
+
+func (m *AppModel) loadSessionsCmd() tea.Cmd {
+	return func() tea.Msg {
+		sessions, err := m.store.ListSessions(50, 0)
+		if err != nil {
+			return SessionsLoadedMsg{Err: err}
+		}
+		results := make([][]store.StoredResult, 0, len(sessions))
+		for _, s := range sessions {
+			_, res, err := m.store.GetSession(s.ID)
+			if err != nil {
+				res = nil
+			}
+			results = append(results, res)
+		}
+		return SessionsLoadedMsg{Sessions: sessions, Results: results, Err: nil}
+	}
+}
+
+func (m *AppModel) loadSessionModelsCmd(id string) tea.Cmd {
+	return func() tea.Msg {
+		_, models, err := m.store.GetSession(id)
+		return SessionModelsLoadedMsg{Models: models, Err: err}
 	}
 }
 
@@ -790,6 +994,28 @@ func (m *AppModel) detailView() string {
 	return b.String()
 }
 
+func (m *AppModel) historyView() string {
+	b := strings.Builder{}
+	if m.sessionModels != nil {
+		b.WriteString(fmt.Sprintf("Session models  esc=back  enter=detail  %d models\n", len(m.sessionModels)))
+		b.WriteString(m.historyList.View())
+		return b.String()
+	}
+	b.WriteString("History  esc=back  enter=models  /=filter\n")
+	if len(m.sessions) == 0 {
+		b.WriteString("No history yet\n")
+	} else {
+		b.WriteString(m.historyList.View())
+		b.WriteByte('\n')
+	}
+	if m.loadingErr != nil {
+		b.WriteString("err: " + m.loadingErr.Error())
+	} else {
+		b.WriteString(fmt.Sprintf("%d sessions", len(m.sessions)))
+	}
+	return b.String()
+}
+
 func (m *AppModel) buildResultsTable() {
 	rows := make([]table.Row, 0, len(m.results))
 	for _, r := range m.results {
@@ -845,6 +1071,22 @@ func (m *AppModel) buildDetailView() {
 	m.viewport.GotoTop()
 }
 
+func (m *AppModel) buildHistoryItems() {
+	items := make([]list.Item, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		items = append(items, historySessionItem{session: s, results: m.historyResults[s.ID]})
+	}
+	m.historyList.SetItems(items)
+}
+
+func (m *AppModel) buildHistoryModelItems() {
+	items := make([]list.Item, 0, len(m.sessionModels))
+	for _, r := range m.sessionModels {
+		items = append(items, historyModelItem{result: r})
+	}
+	m.historyList.SetItems(items)
+}
+
 // --- sizing ---
 
 func (m *AppModel) resize() {
@@ -862,6 +1104,8 @@ func (m *AppModel) resize() {
 		m.viewport.SetHeight(max(4, h-2))
 	case screenRunning:
 		m.progress.SetWidth(w - 12)
+	case screenHistory:
+		m.historyList.SetSize(w, max(4, h-3))
 	}
 }
 
@@ -894,6 +1138,23 @@ func meanTokenCount(runs []model.RunResult) int {
 		return 0
 	}
 	return sum / n
+}
+
+func bestSessionMetrics(results []store.StoredResult) (time.Duration, float64) {
+	var bestTTFT time.Duration
+	var bestTPS float64
+	for _, r := range results {
+		if r.Aggregate.SuccessCount == 0 {
+			continue
+		}
+		if bestTTFT == 0 || r.Aggregate.MeanTTFT < bestTTFT {
+			bestTTFT = r.Aggregate.MeanTTFT
+		}
+		if r.Aggregate.MeanTPS > bestTPS {
+			bestTPS = r.Aggregate.MeanTPS
+		}
+	}
+	return bestTTFT, bestTPS
 }
 
 func max(a, b int) int {
