@@ -3,24 +3,28 @@ package tui
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
+	"io"
+	"log"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"charm.land/bubbles/v2/key"
 	list "charm.land/bubbles/v2/list"
 	progress "charm.land/bubbles/v2/progress"
 	spinner "charm.land/bubbles/v2/spinner"
 	table "charm.land/bubbles/v2/table"
 	viewport "charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
-	"charm.land/bubbles/v2/key"
 	lipgloss "charm.land/lipgloss/v2"
 
 	"github.com/simonteague6/ollama-model-tester/internal/benchmark"
 	"github.com/simonteague6/ollama-model-tester/internal/metrics"
 	"github.com/simonteague6/ollama-model-tester/internal/model"
+	"github.com/simonteague6/ollama-model-tester/internal/store"
 )
 
 // screen enumerates the four TUI states.
@@ -202,10 +206,11 @@ type AppModel struct {
 	runCancel    context.CancelFunc
 	cancelling   bool
 	loadingErr   error
+	store        store.Store
 }
 
 // New creates an AppModel ready to be run by tea.NewProgram.
-func New(cfg model.Config, local, cloud model.Client) *AppModel {
+func New(cfg model.Config, local, cloud model.Client, st store.Store) *AppModel {
 	width, height := 60, 12
 
 	delegate := list.NewDefaultDelegate()
@@ -250,6 +255,7 @@ func New(cfg model.Config, local, cloud model.Client) *AppModel {
 		cfg:         cfg,
 		localClient: local,
 		cloudClient: cloud,
+		store:       st,
 		state:       screenSelect,
 		endpoint:    endpointBoth,
 		width:       width,
@@ -304,6 +310,14 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.results = msg.Results
+		if m.store != nil {
+			go func() {
+				if err := saveSession(m.store, m.cfg, msg.Results); err != nil {
+					// bubbletea has no logger; use stdlib log for warnings.
+					log.Printf("warning: failed to save session: %v\n", err)
+				}
+			}()
+		}
 		m.cancelling = false
 		m.state = screenResults
 		m.sortResults()
@@ -922,4 +936,42 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// saveSession persists the completed benchmark results to the store.
+func saveSession(st store.Store, cfg model.Config, results []benchmark.Result) error {
+	session := store.Session{
+		ID:            newSessionID(),
+		Timestamp:     time.Now(),
+		ModelsTested:  make([]string, 0, len(results)),
+		Prompt:        cfg.Prompt,
+		ConfigSummary: fmt.Sprintf("runs=%d,warmup=%d,max_tokens=%d,timeout=%s,parallel=%d", cfg.Runs, cfg.Warmup, cfg.MaxTokens, cfg.Timeout, cfg.Parallel),
+	}
+	for _, r := range results {
+		session.ModelsTested = append(session.ModelsTested, r.Model.Name)
+	}
+
+	stored := make([]store.StoredResult, 0, len(results))
+	for _, r := range results {
+		stored = append(stored, store.StoredResult{
+			ModelName: r.Model.Name,
+			Endpoint:  r.Model.Endpoint,
+			Aggregate: r.Aggregate,
+			Runs:      r.Runs,
+		})
+	}
+
+	return st.SaveSession(session, stored)
+}
+
+// newSessionID returns a UUID-like string using crypto/rand.
+func newSessionID() string {
+	b := make([]byte, 16)
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		// Fallback to a timestamp-based ID.
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant RFC 4122
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }

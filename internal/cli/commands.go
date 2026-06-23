@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,12 +17,13 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
-	"github.com/spf13/cobra"
 	"github.com/simonteague6/ollama-model-tester/internal/benchmark"
 	"github.com/simonteague6/ollama-model-tester/internal/config"
 	"github.com/simonteague6/ollama-model-tester/internal/model"
 	"github.com/simonteague6/ollama-model-tester/internal/ollama"
+	"github.com/simonteague6/ollama-model-tester/internal/store"
 	"github.com/simonteague6/ollama-model-tester/internal/tui"
+	"github.com/spf13/cobra"
 )
 
 // Dependencies are overridable for testing so the CLI can be exercised without
@@ -32,10 +34,11 @@ var (
 	newRunner      = func(c model.Client, cfg model.Config) runner {
 		return &benchmark.Runner{Client: c, Config: cfg}
 	}
-	runTUIProgram = func(cmd *cobra.Command, cfg *model.Config) {
+	newStore      = store.NewSQLiteStore
+	runTUIProgram = func(cmd *cobra.Command, cfg *model.Config, st store.Store) {
 		local := newLocalClient(cfg.LocalURL)
 		cloud := newCloudClient(cfg.CloudURL, cfg.APIKey)
-		m := tui.New(*cfg, local, cloud)
+		m := tui.New(*cfg, local, cloud, st)
 		p := tea.NewProgram(m, tea.WithInput(cmd.InOrStdin()), tea.WithOutput(cmd.OutOrStdout()))
 		if _, err := p.Run(); err != nil {
 			fmt.Fprintf(cmd.ErrOrStderr(), "tui error: %v\n", err)
@@ -51,11 +54,11 @@ type runner interface {
 // BuildRootCmd constructs the root cobra command with persistent flags and the
 // list, run and tui subcommands. cfg is mutated by Changed() flag guards during
 // command execution so that unset flags never clobber values from env/file.
-func BuildRootCmd(cfg *model.Config) *cobra.Command {
+func BuildRootCmd(cfg *model.Config, st store.Store) *cobra.Command {
 	root := &cobra.Command{
-		Use:   "omt",
+		Use: "omt",
 		Run: func(cmd *cobra.Command, args []string) {
-			runTUI(cmd, cfg)
+			runTUI(cmd, cfg, st)
 		},
 	}
 
@@ -65,8 +68,8 @@ func BuildRootCmd(cfg *model.Config) *cobra.Command {
 	root.PersistentFlags().String("config", "", "Path to a TOML config file")
 
 	root.AddCommand(buildListCmd(cfg))
-	root.AddCommand(buildRunCmd(cfg))
-	root.AddCommand(buildTuiCmd(cfg))
+	root.AddCommand(buildRunCmd(cfg, st))
+	root.AddCommand(buildTuiCmd(cfg, st))
 
 	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		return loadAndApplyConfig(cmd, cfg)
@@ -97,7 +100,7 @@ func buildListCmd(cfg *model.Config) *cobra.Command {
 	}
 }
 
-func buildRunCmd(cfg *model.Config) *cobra.Command {
+func buildRunCmd(cfg *model.Config, st store.Store) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "run [models...]",
 		Short: "Run benchmarks against the specified models",
@@ -125,6 +128,12 @@ func buildRunCmd(cfg *model.Config) *cobra.Command {
 				return err
 			}
 
+			if st != nil {
+				if saveErr := saveSession(st, *cfg, results); saveErr != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "warning: failed to save session: %v\n", saveErr)
+				}
+			}
+
 			jsonOut, _ := cmd.Flags().GetBool("json")
 			sortKey, _ := cmd.Flags().GetString("sort")
 			if sortKey == "" {
@@ -150,19 +159,19 @@ func buildRunCmd(cfg *model.Config) *cobra.Command {
 	return cmd
 }
 
-func buildTuiCmd(cfg *model.Config) *cobra.Command {
+func buildTuiCmd(cfg *model.Config, st store.Store) *cobra.Command {
 	return &cobra.Command{
 		Use:   "tui",
 		Short: "Launch the interactive TUI",
 		Run: func(cmd *cobra.Command, args []string) {
-			runTUI(cmd, cfg)
+			runTUI(cmd, cfg, st)
 		},
 	}
 }
 
 // runTUI creates clients from config and launches the bubbletea TUI.
-func runTUI(cmd *cobra.Command, cfg *model.Config) {
-	runTUIProgram(cmd, cfg)
+func runTUI(cmd *cobra.Command, cfg *model.Config, st store.Store) {
+	runTUIProgram(cmd, cfg, st)
 }
 
 // loadAndApplyConfig reloads configuration from disk/env when --config was set,
@@ -455,4 +464,42 @@ func formatDuration(d time.Duration) string {
 		return strconv.FormatInt(d.Milliseconds(), 10) + "ms"
 	}
 	return fmt.Sprintf("%.2fs", d.Seconds())
+}
+
+// saveSession persists the completed benchmark results to the store.
+func saveSession(st store.Store, cfg model.Config, results []benchmark.Result) error {
+	session := store.Session{
+		ID:            newSessionID(),
+		Timestamp:     time.Now(),
+		ModelsTested:  make([]string, 0, len(results)),
+		Prompt:        cfg.Prompt,
+		ConfigSummary: fmt.Sprintf("runs=%d,warmup=%d,max_tokens=%d,timeout=%s,parallel=%d", cfg.Runs, cfg.Warmup, cfg.MaxTokens, cfg.Timeout, cfg.Parallel),
+	}
+	for _, r := range results {
+		session.ModelsTested = append(session.ModelsTested, r.Model.Name)
+	}
+
+	stored := make([]store.StoredResult, 0, len(results))
+	for _, r := range results {
+		stored = append(stored, store.StoredResult{
+			ModelName: r.Model.Name,
+			Endpoint:  r.Model.Endpoint,
+			Aggregate: r.Aggregate,
+			Runs:      r.Runs,
+		})
+	}
+
+	return st.SaveSession(session, stored)
+}
+
+// newSessionID returns a UUID-like string using crypto/rand.
+func newSessionID() string {
+	b := make([]byte, 16)
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		// Fallback to a timestamp-based ID.
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant RFC 4122
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
