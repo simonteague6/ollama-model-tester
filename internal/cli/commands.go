@@ -70,6 +70,7 @@ func BuildRootCmd(cfg *model.Config, st store.Store) *cobra.Command {
 	root.AddCommand(buildListCmd(cfg))
 	root.AddCommand(buildRunCmd(cfg, st))
 	root.AddCommand(buildTuiCmd(cfg, st))
+	root.AddCommand(buildHistoryCmd(cfg, st))
 
 	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		return loadAndApplyConfig(cmd, cfg)
@@ -158,7 +159,6 @@ func buildRunCmd(cfg *model.Config, st store.Store) *cobra.Command {
 
 	return cmd
 }
-
 func buildTuiCmd(cfg *model.Config, st store.Store) *cobra.Command {
 	return &cobra.Command{
 		Use:   "tui",
@@ -167,6 +167,63 @@ func buildTuiCmd(cfg *model.Config, st store.Store) *cobra.Command {
 			runTUI(cmd, cfg, st)
 		},
 	}
+}
+
+func buildHistoryCmd(cfg *model.Config, st store.Store) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "history",
+		Short: "Browse past benchmark results",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if st == nil {
+				fmt.Fprintln(cmd.OutOrStdout(), "History not available (database not initialized)")
+				return nil
+			}
+
+			modelFilter, _ := cmd.Flags().GetString("model")
+			limit, _ := cmd.Flags().GetInt("limit")
+			jsonOutput, _ := cmd.Flags().GetBool("json")
+			detailID, _ := cmd.Flags().GetString("detail")
+
+			if detailID != "" {
+				session, results, err := st.GetSession(detailID)
+				if err != nil {
+					if errors.Is(err, store.ErrSessionNotFound) {
+						fmt.Fprintf(cmd.OutOrStdout(), "Session %q not found\n", detailID)
+						return nil
+					}
+					return err
+				}
+				return writeSessionDetail(cmd.OutOrStdout(), session, results)
+			}
+
+			sessions, err := st.ListSessions(limit, 0)
+			if err != nil {
+				return err
+			}
+
+			if modelFilter != "" {
+				sessions = filterSessionsByModel(sessions, modelFilter)
+			}
+
+			if len(sessions) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "No benchmark history yet")
+				return nil
+			}
+
+			if jsonOutput {
+				return writeJSONSessions(cmd.OutOrStdout(), sessions)
+			}
+
+			return writeSessionsTable(cmd.OutOrStdout(), st, sessions)
+		},
+	}
+
+	cmd.Flags().String("model", "", "Filter sessions by model name")
+	cmd.Flags().Int("limit", 20, "Max sessions to show")
+	cmd.Flags().Bool("json", false, "Output JSON array")
+	cmd.Flags().String("detail", "", "Show per-model results for one session")
+
+	return cmd
 }
 
 // runTUI creates clients from config and launches the bubbletea TUI.
@@ -397,6 +454,120 @@ func resultToJSON(r benchmark.Result) jsonRow {
 		SuccessCount:  a.SuccessCount,
 		FailCount:     a.FailCount,
 	}
+}
+
+func filterSessionsByModel(sessions []store.Session, name string) []store.Session {
+	filtered := make([]store.Session, 0, len(sessions))
+	for _, s := range sessions {
+		for _, m := range s.ModelsTested {
+			if m == name {
+				filtered = append(filtered, s)
+				break
+			}
+		}
+	}
+	return filtered
+}
+
+func writeJSONSessions(w io.Writer, sessions []store.Session) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(sessions)
+}
+
+func writeSessionsTable(w io.Writer, st store.Store, sessions []store.Session) error {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "DATE\tMODELS\tBEST TTFT\tBEST TOK/S")
+	for _, s := range sessions {
+		bestTTFT, bestTPS := sessionBestMetrics(st, s.ID)
+		bestTTFTStr := "-"
+		if bestTTFT >= 0 {
+			bestTTFTStr = formatDuration(bestTTFT)
+		}
+		bestTPSStr := "-"
+		if bestTPS >= 0 {
+			bestTPSStr = fmt.Sprintf("%.2f", bestTPS)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n",
+			s.Timestamp.Format("2006-01-02 15:04"),
+			strings.Join(s.ModelsTested, ", "),
+			bestTTFTStr,
+			bestTPSStr,
+		)
+	}
+	return tw.Flush()
+}
+
+func sessionBestMetrics(st store.Store, id string) (time.Duration, float64) {
+	_, results, err := st.GetSession(id)
+	if err != nil || len(results) == 0 {
+		return -1, -1
+	}
+	var bestTTFT time.Duration = -1
+	var bestTPS float64 = -1
+	for _, r := range results {
+		if bestTTFT < 0 || r.Aggregate.MinTTFT < bestTTFT {
+			bestTTFT = r.Aggregate.MinTTFT
+		}
+		if bestTPS < 0 || r.Aggregate.MaxTPS > bestTPS {
+			bestTPS = r.Aggregate.MaxTPS
+		}
+	}
+	return bestTTFT, bestTPS
+}
+
+func writeSessionDetail(w io.Writer, session store.Session, results []store.StoredResult) error {
+	fmt.Fprintf(w, "Session: %s\n", session.ID)
+	fmt.Fprintf(w, "Date: %s\n", session.Timestamp.Format(time.RFC3339))
+	fmt.Fprintf(w, "Models: %s\n", strings.Join(session.ModelsTested, ", "))
+	fmt.Fprintf(w, "Prompt: %s\n", session.Prompt)
+	fmt.Fprintf(w, "Config: %s\n\n", session.ConfigSummary)
+
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "MODEL\tENDPOINT\tTTFT\tTOK/S\tTOTAL\tOK")
+	for _, r := range results {
+		a := r.Aggregate
+		totalRuns := a.SuccessCount + a.FailCount
+		ok := fmt.Sprintf("%d/%d", a.SuccessCount, totalRuns)
+		if a.SuccessCount == 0 {
+			ok = "FAIL"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%.2f\t%s\t%s\n",
+			r.ModelName,
+			r.Endpoint,
+			formatDuration(a.MedianTTFT),
+			a.MedianTPS,
+			formatDuration(a.MedianTotal),
+			ok,
+		)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+
+	for _, r := range results {
+		fmt.Fprintf(w, "\n%s (%s)\n", r.ModelName, r.Endpoint)
+		rtw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(rtw, "RUN\tTTFT\tTOK/S\tTOTAL\tTOKENS\tERROR")
+		for i, run := range r.Runs {
+			errStr := run.Error
+			if errStr == "" {
+				errStr = "-"
+			}
+			fmt.Fprintf(rtw, "%d\t%s\t%.2f\t%s\t%d\t%s\n",
+				i+1,
+				formatDuration(run.TTFT),
+				run.TokensPerSec,
+				formatDuration(run.TotalTime),
+				run.TokenCount,
+				errStr,
+			)
+		}
+		if err := rtw.Flush(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func aggregateTokens(runs []model.RunResult) int {
