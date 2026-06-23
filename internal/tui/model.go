@@ -742,16 +742,51 @@ func (m *AppModel) runningView() string {
 	b.WriteString(m.progress.ViewAs(pct))
 	b.WriteByte('\n')
 
-	// Show the most recently completed model summaries that fit the terminal.
+	// Show per-run metrics for in-progress models, then completed aggregates.
 	remaining := m.height - 4
 	if remaining > 0 {
-		start := max(0, len(m.runLive)-remaining)
-		for _, r := range m.runLive[start:] {
-			b.WriteString(fmt.Sprintf("%s/%s  TTFT:%s  tok/s:%.1f  Total:%s\n",
-				r.Model.Name, r.Model.Endpoint,
-				formatDuration(r.Aggregate.MeanTTFT),
-				r.Aggregate.MeanTPS,
-				formatDuration(r.Aggregate.MeanTotal)))
+		// Collect in-progress model display lines.
+		keys := make([]string, 0, len(m.runProgress))
+		for k := range m.runProgress {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		var inProgress []string
+		for _, k := range keys {
+			runs := m.runProgress[k]
+			if len(runs) >= m.cfg.Runs {
+				continue
+			}
+			name, endpoint, _ := strings.Cut(k, "|")
+			inProgress = append(inProgress, fmt.Sprintf("%s/%s", name, endpoint))
+			for i, r := range runs {
+				inProgress = append(inProgress, fmt.Sprintf("  Run %d: TTFT:%s  tok/s:%.1f  Total:%s",
+					i+1,
+					formatDuration(r.TTFT),
+					r.TokensPerSec,
+					formatDuration(r.TotalTime)))
+			}
+		}
+
+		for _, line := range inProgress {
+			if remaining <= 0 {
+				break
+			}
+			b.WriteString(line)
+			b.WriteByte('\n')
+			remaining--
+		}
+
+		if remaining > 0 {
+			start := max(0, len(m.runLive)-remaining)
+			for _, r := range m.runLive[start:] {
+				b.WriteString(fmt.Sprintf("%s/%s  TTFT:%s  tok/s:%.1f  Total:%s\n",
+					r.Model.Name, r.Model.Endpoint,
+					formatDuration(r.Aggregate.MeanTTFT),
+					r.Aggregate.MeanTPS,
+					formatDuration(r.Aggregate.MeanTotal)))
+			}
 		}
 	}
 	b.WriteString("esc=cancel")

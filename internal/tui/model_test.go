@@ -335,3 +335,27 @@ func TestDetailViewIncludesAggregateAndPerRunData(t *testing.T) {
 		}
 	}
 }
+
+func TestRunningViewShowsPerRunMetricsForInProgressModels(t *testing.T) {
+	m := New(model.Config{Runs: 5}, nil, nil)
+	m, _ = update(m, ListLoadedMsg{Models: []model.Model{
+		{Name: "llama3", Endpoint: "local"},
+	}})
+	m = pressKeys(m, "space", "enter")
+
+	for i := 0; i < 2; i++ {
+		m, _ = update(m, ProgressMsg{
+			Name:     "llama3",
+			Endpoint: "local",
+			RunIndex: i,
+			Result:   makeRun(10*time.Millisecond, 50*time.Millisecond, 20, 10),
+		})
+	}
+
+	v := viewString(m)
+	for _, want := range []string{"llama3/local", "Run 1", "Run 2", "TTFT:", "tok/s:", "Total:"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("expected running view to contain %q, got:\n%s", want, v)
+		}
+	}
+}
