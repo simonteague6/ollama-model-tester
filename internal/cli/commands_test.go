@@ -1,0 +1,391 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/spf13/cobra"
+	"github.com/simonteague6/ollama-model-tester/internal/benchmark"
+	"github.com/simonteague6/ollama-model-tester/internal/model"
+)
+
+type fakeRunner struct {
+	results []benchmark.Result
+	err     error
+}
+
+func (f *fakeRunner) Run(ctx context.Context, models []model.Model) ([]benchmark.Result, error) {
+	return f.results, f.err
+}
+
+type fakeClient struct {
+	models []model.Model
+}
+
+func (f *fakeClient) ListModels(ctx context.Context) ([]model.Model, error) {
+	return f.models, nil
+}
+
+func (f *fakeClient) Generate(ctx context.Context, req model.GenerateRequest) (model.GenerateStream, error) {
+	return nil, errors.New("not implemented")
+}
+
+func setFakeRunner(results []benchmark.Result) func() {
+	orig := newRunner
+	newRunner = func(c model.Client, cfg model.Config) runner {
+		return &fakeRunner{results: results}
+	}
+	return func() { newRunner = orig }
+}
+
+func setFakeClients(local, cloud []model.Model) func() {
+	origLocal := newLocalClient
+	origCloud := newCloudClient
+	newLocalClient = func(baseURL string) model.Client {
+		return &fakeClient{models: local}
+	}
+	newCloudClient = func(baseURL, apiKey string) model.Client {
+		return &fakeClient{models: cloud}
+	}
+	return func() {
+		newLocalClient = origLocal
+		newCloudClient = origCloud
+	}
+}
+
+func TestBareRootPrintsStub(t *testing.T) {
+	cfg := model.Config{}
+	root := BuildRootCmd(&cfg)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{})
+
+	// Override TUI launch to avoid blocking on real bubbletea program.
+	orig := runTUIProgram
+	runTUIProgram = func(cmd *cobra.Command, cfg *model.Config) {
+		fmt.Fprintln(cmd.OutOrStdout(), "TUI launched")
+	}
+	defer func() { runTUIProgram = orig }()
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if !strings.Contains(out.String(), "TUI launched") {
+		t.Errorf("expected TUI launch message, got %q", out.String())
+	}
+}
+
+func TestTuiCommandPrintsStub(t *testing.T) {
+	cfg := model.Config{}
+	root := BuildRootCmd(&cfg)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"tui"})
+
+	orig := runTUIProgram
+	runTUIProgram = func(cmd *cobra.Command, cfg *model.Config) {
+		fmt.Fprintln(cmd.OutOrStdout(), "TUI launched")
+	}
+	defer func() { runTUIProgram = orig }()
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if !strings.Contains(out.String(), "TUI launched") {
+		t.Errorf("expected TUI launch message, got %q", out.String())
+	}
+}
+
+func TestFlagBindingOnlyChangesSetFlags(t *testing.T) {
+	cfg := model.Config{
+		Runs:      5,
+		Warmup:    1,
+		Prompt:    "default prompt",
+		MaxTokens: 256,
+		Timeout:   60 * time.Second,
+		Parallel:  1,
+		SortKey:   "ttft",
+		LocalURL:  "http://localhost:11434",
+		CloudURL:  "https://ollama.com/api",
+		APIKey:    "secret",
+	}
+	defer setFakeRunner(nil)()
+
+	root := BuildRootCmd(&cfg)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{
+		"run", "model1",
+		"--local",
+		"--runs", "3",
+		"--prompt", "custom prompt",
+	})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	if cfg.Runs != 3 {
+		t.Errorf("Runs changed unexpectedly: got %d, want 3", cfg.Runs)
+	}
+	if cfg.Prompt != "custom prompt" {
+		t.Errorf("Prompt not updated: got %q, want %q", cfg.Prompt, "custom prompt")
+	}
+	if cfg.Warmup != 1 {
+		t.Errorf("Warmup clobbered: got %d, want 1", cfg.Warmup)
+	}
+	if cfg.MaxTokens != 256 {
+		t.Errorf("MaxTokens clobbered: got %d, want 256", cfg.MaxTokens)
+	}
+	if cfg.Timeout != 60*time.Second {
+		t.Errorf("Timeout clobbered: got %v, want 60s", cfg.Timeout)
+	}
+	if cfg.Parallel != 1 {
+		t.Errorf("Parallel clobbered: got %d, want 1", cfg.Parallel)
+	}
+	if cfg.SortKey != "ttft" {
+		t.Errorf("SortKey clobbered: got %q, want ttft", cfg.SortKey)
+	}
+}
+
+func TestCloudAPIKeyPreFlight(t *testing.T) {
+	cfg := model.Config{CloudURL: "https://ollama.com/api"} // APIKey intentionally empty
+	root := BuildRootCmd(&cfg)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{"run", "llama", "--cloud"})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected error for missing cloud API key")
+	}
+	if !strings.Contains(err.Error(), "OLLAMA_API_KEY") {
+		t.Errorf("error should mention OLLAMA_API_KEY: %v", err)
+	}
+}
+
+func TestListOutputFormat(t *testing.T) {
+	cfg := model.Config{
+		APIKey:   "secret",
+		LocalURL: "http://local",
+		CloudURL: "https://cloud",
+	}
+	defer setFakeClients(
+		[]model.Model{{Name: "local-model", Endpoint: "local"}},
+		[]model.Model{{Name: "cloud-model", Endpoint: "cloud"}},
+	)()
+
+	root := BuildRootCmd(&cfg)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"list", "--both"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	output := out.String()
+	if !strings.Contains(output, "MODEL") || !strings.Contains(output, "ENDPOINT") {
+		t.Errorf("expected table headers, got:\n%s", output)
+	}
+	if !strings.Contains(output, "local-model") {
+		t.Errorf("expected local row, got:\n%s", output)
+	}
+	if !strings.Contains(output, "cloud-model") {
+		t.Errorf("expected cloud row, got:\n%s", output)
+	}
+}
+
+func TestRunWithFakeClient(t *testing.T) {
+	cfg := model.Config{
+		APIKey:   "secret",
+		CloudURL: "https://cloud",
+		SortKey:  "ttft",
+	}
+	results := []benchmark.Result{
+		{
+			Model: model.Model{Name: "llama", Endpoint: "cloud"},
+			Aggregate: model.AggregateResult{
+				MeanTTFT:     100 * time.Millisecond,
+				MedianTTFT:   100 * time.Millisecond,
+				MeanTPS:      50.0,
+				MedianTPS:    50.0,
+				MeanTotal:    1 * time.Second,
+				MedianTotal:  1 * time.Second,
+				SuccessCount: 5,
+				FailCount:    0,
+			},
+		},
+	}
+	defer setFakeRunner(results)()
+
+	root := BuildRootCmd(&cfg)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"run", "llama", "--cloud"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	output := out.String()
+	if !strings.Contains(output, "llama") {
+		t.Errorf("expected model name, got:\n%s", output)
+	}
+	if !strings.Contains(output, "50.00") {
+		t.Errorf("expected tok/s value, got:\n%s", output)
+	}
+	if !strings.Contains(output, "5/5") {
+		t.Errorf("expected OK count, got:\n%s", output)
+	}
+}
+func TestRunPrintsPartialResultsOnCancellation(t *testing.T) {
+	cfg := model.Config{
+		APIKey:   "secret",
+		CloudURL: "https://cloud",
+	}
+	results := []benchmark.Result{
+		{
+			Model: model.Model{Name: "llama", Endpoint: "cloud"},
+			Aggregate: model.AggregateResult{
+				MeanTTFT:     100 * time.Millisecond,
+				MedianTTFT:   100 * time.Millisecond,
+				MeanTPS:      50.0,
+				MedianTPS:    50.0,
+				MeanTotal:    1 * time.Second,
+				MedianTotal:  1 * time.Second,
+				SuccessCount: 5,
+				FailCount:    0,
+			},
+		},
+	}
+	defer setFakeRunnerWithErr(results, context.Canceled)()
+
+	root := BuildRootCmd(&cfg)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"run", "llama", "--cloud"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	if !strings.Contains(out.String(), "llama") {
+		t.Errorf("expected partial results to be printed, got:\n%s", out.String())
+	}
+}
+
+func setFakeRunnerWithErr(results []benchmark.Result, err error) func() {
+	orig := newRunner
+	newRunner = func(c model.Client, cfg model.Config) runner {
+		return &fakeRunner{results: results, err: err}
+	}
+	return func() { newRunner = orig }
+}
+
+func TestRunJSONGoldenOutput(t *testing.T) {
+	cfg := model.Config{
+		APIKey:   "secret",
+		CloudURL: "https://cloud",
+	}
+	results := []benchmark.Result{
+		{
+			Model: model.Model{Name: "llama", Endpoint: "cloud"},
+			Aggregate: model.AggregateResult{
+				MeanTTFT:     100 * time.Millisecond,
+				MedianTTFT:   100 * time.Millisecond,
+				MinTTFT:      90 * time.Millisecond,
+				MaxTTFT:      110 * time.Millisecond,
+				MeanTPS:      50.0,
+				MedianTPS:    50.0,
+				MinTPS:       48.0,
+				MaxTPS:       52.0,
+				MeanTotal:    1 * time.Second,
+				MedianTotal:  1 * time.Second,
+				MinTotal:     900 * time.Millisecond,
+				MaxTotal:     1100 * time.Millisecond,
+				SuccessCount: 5,
+				FailCount:    0,
+			},
+			Runs: []model.RunResult{
+				{TTFT: 100 * time.Millisecond, TokensPerSec: 50.0, TotalTime: 1 * time.Second, TokenCount: 10},
+			},
+		},
+	}
+	defer setFakeRunner(results)()
+
+	root := BuildRootCmd(&cfg)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"run", "llama", "--cloud", "--json"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	var rows []jsonRow
+	if err := json.Unmarshal(out.Bytes(), &rows); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, out.String())
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 JSON row, got %d", len(rows))
+	}
+	row := rows[0]
+	if row.Model != "llama" {
+		t.Errorf("Model: got %q, want llama", row.Model)
+	}
+	if row.Endpoint != "cloud" {
+		t.Errorf("Endpoint: got %q, want cloud", row.Endpoint)
+	}
+	if row.TTFTMs != 100 {
+		t.Errorf("TTFTMs: got %d, want 100", row.TTFTMs)
+	}
+	if row.TokensPerSec != 50.0 {
+		t.Errorf("TokensPerSec: got %f, want 50.0", row.TokensPerSec)
+	}
+	if row.OK != "5/5" {
+		t.Errorf("OK: got %q, want 5/5", row.OK)
+	}
+	if row.SuccessCount != 5 || row.FailCount != 0 {
+		t.Errorf("counts: got %d/%d, want 5/0", row.SuccessCount, row.FailCount)
+	}
+}
+
+func TestSortResultsDescending(t *testing.T) {
+	results := []benchmark.Result{
+		{
+			Model:     model.Model{Name: "a"},
+			Aggregate: model.AggregateResult{MedianTPS: 10.0, MedianTTFT: 200 * time.Millisecond, MedianTotal: 2 * time.Second},
+		},
+		{
+			Model:     model.Model{Name: "b"},
+			Aggregate: model.AggregateResult{MedianTPS: 20.0, MedianTTFT: 100 * time.Millisecond, MedianTotal: 1 * time.Second},
+		},
+	}
+
+	tests := []struct {
+		key      string
+		wantFirst string
+	}{
+		{"tok/s", "b"},
+		{"ttft", "a"},
+		{"total", "a"},
+		{"model", "b"},
+	}
+
+	for _, tc := range tests {
+		cp := append([]benchmark.Result{}, results...)
+		sortResults(cp, tc.key)
+		if cp[0].Model.Name != tc.wantFirst {
+			t.Errorf("sort by %q: expected %s first, got %s", tc.key, tc.wantFirst, cp[0].Model.Name)
+		}
+	}
+}
