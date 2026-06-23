@@ -104,9 +104,21 @@ max_tokens = 256
 timeout = "60s"
 parallel = 1
 sort_key = "ttft"
+api_key = "sk-..."     # optional — can also use OLLAMA_API_KEY env var
+
+### API key
+
+Set your Ollama Cloud API key using either method:
+
+**Environment variable (recommended, highest precedence):**
+```bash
+export OLLAMA_API_KEY="sk-..."
 ```
 
-The API key is **never** stored in the config file — use `OLLAMA_API_KEY` env var only.
+**Config file at `~/.omt/config.toml`:**
+```toml
+api_key = "sk-..."
+```
 
 ## Metrics
 
@@ -135,15 +147,25 @@ Select ──→ Running ──→ Results ──→ Detail
 
 ## Cloud endpoint
 
-To benchmark cloud models, set your Ollama API key:
+To benchmark cloud models, set your Ollama API key using either method:
 
 ```bash
-export OLLAMA_API_KEY="sk-..."
+export OLLAMA_API_KEY="sk-..."           # environment variable (recommended)
+```
+
+Or in `~/.omt/config.toml`:
+
+```toml
+api_key = "sk-..."
+```
+
+Then:
+```bash
 omt list --cloud
 omt run gemma3:cloud --cloud
 ```
 
-Missing API key? `omt` exits with a clear error before making any network calls.
+Missing API key? `omt` exits with a clear error (telling you how to fix it) before making any network calls.
 
 ## Building from source
 

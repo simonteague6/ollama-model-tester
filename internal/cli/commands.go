@@ -253,7 +253,7 @@ func selectedEndpoints(cmd *cobra.Command) []string {
 func checkCloudAPIKey(endpoints []string, apiKey string) error {
 	for _, e := range endpoints {
 		if e == "cloud" && apiKey == "" {
-			return errors.New("cloud endpoint selected but OLLAMA_API_KEY is not configured")
+			return errors.New("cloud endpoint selected but OLLAMA_API_KEY is not configured. Set it via:\n  export OLLAMA_API_KEY=\"sk-...\"\n  or add api_key = \"sk-...\" to ~/.omt/config.toml")
 		}
 	}
 	return nil
