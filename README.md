@@ -7,10 +7,12 @@ Benchmark your Ollama models. Measure time-to-first-token, tokens-per-second, an
 **Go 1.25+ required.** If you don't have Go: [go.dev/dl](https://go.dev/dl/)
 
 ```bash
-go install github.com/simonteague6/ollama-model-tester/cmd/omt@latest
-```
+# Install the latest release (recommended):
+go install github.com/simonteague6/ollama-model-tester/cmd/omt@v0.1.0
 
-This puts `omt` in `~/go/bin/`. Make sure `~/go/bin` is in your `PATH` (`export PATH="$HOME/go/bin:$PATH"` in your `.zshrc` or `.bashrc`).
+# Or track the bleeding-edge main branch:
+go install github.com/simonteague6/ollama-model-tester/cmd/omt@main
+```
 
 To install from a local clone instead:
 
