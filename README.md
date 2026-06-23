@@ -38,6 +38,10 @@ omt run llama3.2 --local --json
 omt
 ```
 
+## Screenshot
+
+![omt TUI results screen](docs/screenshot.png)
+
 ## Commands
 
 ### `omt` / `omt tui`
@@ -76,6 +80,18 @@ omt run model1 model2 --local
 | `--sort` | `ttft` | Sort key: `ttft`, `tok/s`, `total`, `model` |
 | `--json` | — | Output JSON instead of table |
 | `--config` | — | Path to TOML config file |
+
+### `omt history`
+
+Browse past benchmark results.
+
+```
+omt history                  # list recent sessions
+omt history --model llama3.2 # filter by model name
+omt history --limit 5        # limit results
+omt history --json           # JSON output
+omt history --detail <id>    # per-model breakdown for a session
+```
 
 ## Configuration
 
@@ -138,14 +154,19 @@ Results are aggregated: mean, median, min, max for each metric across all succes
 
 ```
 Select ──→ Running ──→ Results ──→ Detail
-  ↑                      │  ↑         │
-  └──────────────────────┘  └─────────┘
+  ↑          │             ↑  ↑         │
+  │          │             │  └─────────┘
+  │          │             │
+  └──────────┘             │
+  ↑                        │
+History ←──────────────────┘
 ```
 
-- **Select** — toggle local/cloud/both, filter models (`/`), toggle selection (`Space`), start (`Enter`)
-- **Running** — spinner, progress bar, live per-model metrics. `Esc` cancels with partial results.
+- **Select** — toggle local/cloud/both, filter models (`/`), toggle selection (`Space`), start (`Enter`), history (`h`)
+- **Running** — spinner, progress bar, live per-run and per-model metrics. `Esc` cancels with partial results.
 - **Results** — sortable table. `s` cycles sort key, `Enter` opens detail, `r` re-runs, `q` quits.
 - **Detail** — aggregate stats + per-run breakdown for one model. `Esc` returns to Results.
+- **History** — browse past benchmark sessions. `Enter` drills into session models, then into per-run detail. `Esc` returns to Select.
 
 ## Cloud endpoint
 
