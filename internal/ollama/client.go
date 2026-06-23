@@ -199,13 +199,17 @@ func (s *stream) Next() (model.GenerateResponse, error) {
 		return model.GenerateResponse{}, err
 	}
 
+	evalDuration := time.Duration(chunk.EvalDuration)
+	if evalDuration == 0 && chunk.TotalDuration > 0 {
+		evalDuration = time.Duration(chunk.TotalDuration)
+	}
 	return model.GenerateResponse{
 		Token:              chunk.Response,
 		Done:               chunk.Done,
 		TotalDuration:      time.Duration(chunk.TotalDuration),
 		LoadDuration:       time.Duration(chunk.LoadDuration),
 		PromptEvalDuration: time.Duration(chunk.PromptEvalDuration),
-		EvalDuration:       time.Duration(chunk.EvalDuration),
+		EvalDuration:       evalDuration,
 		EvalCount:          chunk.EvalCount,
 		PromptEvalCount:    chunk.PromptEvalCount,
 	}, nil
